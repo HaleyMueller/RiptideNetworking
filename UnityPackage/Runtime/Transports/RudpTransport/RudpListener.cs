@@ -14,6 +14,17 @@ namespace RiptideNetworking.Transports.RudpTransport
     /// <summary>Provides base sending &#38; receiving functionality for <see cref="RudpServer"/> and <see cref="RudpClient"/>.</summary>
     public abstract class RudpListener
     {
+        /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.timedOut"/>.</summary>
+        protected const string ReasonTimedOut = "Timed out";
+        /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.kicked"/>.</summary>
+        protected const string ReasonKicked = "Kicked";
+        /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.serverStopped"/>.</summary>
+        protected const string ReasonServerStopped = "Server stopped";
+        /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.disconnected"/>.</summary>
+        protected const string ReasonDisconnected = "Disconnected";
+        /// <summary>The text to log when disconnected due to an unknown reason.</summary>
+        protected const string ReasonUnknown = "Unknown reason";
+
         /// <summary>The name to use when logging messages via <see cref="RiptideLogger"/>.</summary>
         public readonly string LogName;
 
@@ -49,8 +60,6 @@ namespace RiptideNetworking.Transports.RudpTransport
                 if (isRunning)
                     StopListening();
 
-                Message.IncreasePoolCount();
-
                 IPEndPoint localEndPoint = new IPEndPoint(IPAddress.IPv6Any, port);
                 socket = new Socket(SocketType.Dgram, ProtocolType.Udp);
                 socket.Bind(localEndPoint);
@@ -71,8 +80,6 @@ namespace RiptideNetworking.Transports.RudpTransport
 
                 isRunning = false;
                 socket.Close();
-
-                Message.DecreasePoolCount();
             }
         }
 
@@ -80,7 +87,7 @@ namespace RiptideNetworking.Transports.RudpTransport
         private void Receive()
         {
             EndPoint bufferEndPoint = new IPEndPoint(socket.AddressFamily == AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
-            receiveBuffer = new byte[Message.MaxMessageSize + RiptideConverter.UShortLength];
+            receiveBuffer = new byte[Message.MaxSize + RiptideConverter.UShortLength];
 
             while (isRunning)
             {

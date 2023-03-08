@@ -22,7 +22,7 @@ namespace RiptideNetworking.Transports.RudpTransport
         /// <inheritdoc/>
         public event EventHandler<ClientMessageReceivedEventArgs> MessageReceived;
         /// <inheritdoc/>
-        public event EventHandler Disconnected;
+        public event EventHandler<DisconnectedEventArgs> Disconnected;
         /// <inheritdoc/>
         public event EventHandler<ClientConnectedEventArgs> ClientConnected;
         /// <inheritdoc/>
@@ -96,10 +96,10 @@ namespace RiptideNetworking.Transports.RudpTransport
 
         /// <inheritdoc/>
         /// <remarks>Expects the host address to consist of an IP and port, separated by a colon. For example: <c>127.0.0.1:7777</c>.</remarks>
-        public void Connect(string hostAddress, Message message)
+        public bool Connect(string hostAddress, Message message)
         {
             if (!ParseHostAddress(hostAddress, out IPAddress ip, out ushort port))
-                return;
+                return false;
 
             connectionAttempts = 0;
             remoteEndPoint = new IPEndPoint(ip.MapToIPv6(), port);
@@ -118,6 +118,7 @@ namespace RiptideNetworking.Transports.RudpTransport
 
             heartbeatTimer = new Timer((o) => Heartbeat(), null, 0, HeartbeatInterval);
             RiptideLogger.Log(LogType.info, LogName, $"Connecting to {remoteEndPoint.ToStringBasedOnIPFormat()}...");
+            return true;
         }
 
         /// <summary>Parses the <paramref name="hostAddress"/> and retrieves its <paramref name="ip"/> and <paramref name="port"/>, if possible.</summary>
@@ -160,7 +161,7 @@ namespace RiptideNetworking.Transports.RudpTransport
                 // If still trying to connect, send connect messages instead of heartbeats
                 if (connectionAttempts < maxConnectionAttempts)
                 {
-                    SendConnect();
+                    Send(Message.Create(HeaderType.connect));
                     connectionAttempts++;
                 }
                 else
@@ -171,7 +172,7 @@ namespace RiptideNetworking.Transports.RudpTransport
                 // If connected and not timed out, send heartbeats
                 if (HasTimedOut)
                 {
-                    OnDisconnected();
+                    Disconnect(DisconnectReason.timedOut);
                     return;
                 }
 
@@ -225,13 +226,13 @@ namespace RiptideNetworking.Transports.RudpTransport
                     HandleWelcome(message);
                     break;
                 case HeaderType.clientConnected:
-                    HandleClientConnected(message);
+                    OnClientConnected(new ClientConnectedEventArgs(message.GetUShort()));
                     break;
                 case HeaderType.clientDisconnected:
-                    HandleClientDisconnected(message);
+                    OnClientDisconnected(new ClientDisconnectedEventArgs(message.GetUShort()));
                     break;
                 case HeaderType.disconnect:
-                    HandleDisconnect();
+                    Disconnect((DisconnectReason)message.GetByte(), message.UnreadLength > 0 ? message.GetString() : "");
                     break;
                 default:
                     RiptideLogger.Log(LogType.warning, LogName, $"Unknown message header type '{messageHeader}'! Discarding {message.WrittenLength} bytes.");
@@ -265,9 +266,39 @@ namespace RiptideNetworking.Transports.RudpTransport
             if (IsNotConnected)
                 return;
 
-            SendDisconnect(); // This will just not send if already disconnected
+            Send(Message.Create(HeaderType.disconnect));
+            Disconnect(DisconnectReason.disconnected);
+        }
+        /// <summary>Disconnects from the server.</summary>
+        /// <param name="reason">The reason why the client is disconnecting/has disconnected.</param>
+        /// <param name="customMessage">An optional custom message to display for the disconnection reason. Only used when <paramref name="reason"/> is set to <see cref="DisconnectReason.kicked"/>.</param>
+        private void Disconnect(DisconnectReason reason, string customMessage = "")
+        {
             if (LocalDisconnect())
-                RiptideLogger.Log(LogType.info, LogName, "Disconnected from server (initiated locally).");
+            {
+                string reasonString;
+                switch (reason)
+                {
+                    case DisconnectReason.timedOut:
+                        reasonString = ReasonTimedOut;
+                        break;
+                    case DisconnectReason.kicked:
+                        reasonString = string.IsNullOrEmpty(customMessage) ? ReasonKicked : customMessage;
+                        break;
+                    case DisconnectReason.serverStopped:
+                        reasonString = ReasonServerStopped;
+                        break;
+                    case DisconnectReason.disconnected:
+                        reasonString = ReasonDisconnected;
+                        break;
+                    default:
+                        reasonString = ReasonUnknown;
+                        break;
+                }
+
+                RiptideLogger.Log(LogType.info, LogName, $"Disconnected from server: {reasonString}.");
+                OnDisconnected(new DisconnectedEventArgs(reason, customMessage));
+            }
         }
 
         /// <summary>Cleans up local objects on disconnection.</summary>
@@ -293,24 +324,18 @@ namespace RiptideNetworking.Transports.RudpTransport
         }
 
         #region Messages
-        /// <summary>Sends a connect message.</summary>
-        private void SendConnect()
-        {
-            Send(Message.Create(HeaderType.connect));
-        }
-
         /// <inheritdoc/>
         protected override void SendAck(ushort forSeqId, IPEndPoint toEndPoint)
         {
             Message message = Message.Create(forSeqId == peer.SendLockables.LastReceivedSeqId ? HeaderType.ack : HeaderType.ackExtra);
-            message.Add(peer.SendLockables.LastReceivedSeqId); // Last remote sequence ID
-            message.Add(peer.SendLockables.AcksBitfield); // Acks
+            message.AddUShort(peer.SendLockables.LastReceivedSeqId); // Last remote sequence ID
+            message.AddUShort(peer.SendLockables.AcksBitfield); // Acks
 
             if (forSeqId == peer.SendLockables.LastReceivedSeqId)
                 Send(message);
             else
             {
-                message.Add(forSeqId);
+                message.AddUShort(forSeqId);
                 Send(message);
             }
         }
@@ -345,8 +370,8 @@ namespace RiptideNetworking.Transports.RudpTransport
             pendingPingStopwatch.Restart();
 
             Message message = Message.Create(HeaderType.heartbeat);
-            message.Add(pendingPingId);
-            message.Add(peer.RTT);
+            message.AddByte(pendingPingId);
+            message.AddShort(peer.RTT);
 
             Send(message);
         }
@@ -382,40 +407,14 @@ namespace RiptideNetworking.Transports.RudpTransport
         private void SendWelcomeReceived()
         {
             Message message = Message.Create(HeaderType.welcome, 25);
-            message.Add(Id);
+            message.AddUShort(Id);
             if (connectBytes != null)
             {
-                message.Add(connectBytes, false);
+                message.AddBytes(connectBytes, false);
                 connectBytes = null;
             }
 
             Send(message);
-        }
-
-        /// <summary>Handles a client connected message.</summary>
-        /// <param name="message">The client connected message to handle.</param>
-        private void HandleClientConnected(Message message)
-        {
-            OnClientConnected(new ClientConnectedEventArgs(message.GetUShort()));
-        }
-
-        /// <summary>Handles a client disconnected message.</summary>
-        /// <param name="message">The client disconnected message to handle.</param>
-        private void HandleClientDisconnected(Message message)
-        {
-            OnClientDisconnected(new ClientDisconnectedEventArgs(message.GetUShort()));
-        }
-
-        /// <summary>Sends a disconnect message.</summary>
-        private void SendDisconnect()
-        {
-            Send(Message.Create(HeaderType.disconnect));
-        }
-
-        /// <summary>Handles a disconnect message.</summary>
-        private void HandleDisconnect()
-        {
-            OnDisconnected();
         }
         #endregion
 
@@ -446,13 +445,10 @@ namespace RiptideNetworking.Transports.RudpTransport
         }
 
         /// <summary>Invokes the <see cref="Disconnected"/> event.</summary>
-        private void OnDisconnected()
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnDisconnected(DisconnectedEventArgs e)
         {
-            if (LocalDisconnect())
-            {
-                RiptideLogger.Log(LogType.info, LogName, "Disconnected from server (initiated remotely).");
-                receiveActionQueue.Add(() => Disconnected?.Invoke(this, EventArgs.Empty));
-            }
+            receiveActionQueue.Add(() => Disconnected?.Invoke(this, e));
         }
 
         /// <summary>Invokes the <see cref="ClientConnected"/> event.</summary>

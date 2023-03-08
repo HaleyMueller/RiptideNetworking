@@ -22,7 +22,7 @@ namespace RiptideNetworking
         /// <inheritdoc cref="IClient.MessageReceived"/>
         public event EventHandler<ClientMessageReceivedEventArgs> MessageReceived;
         /// <inheritdoc cref="IClient.Disconnected"/>
-        public event EventHandler Disconnected;
+        public event EventHandler<DisconnectedEventArgs> Disconnected;
         /// <inheritdoc cref="IClient.ClientConnected"/>
         public event EventHandler<ClientConnectedEventArgs> ClientConnected;
         /// <inheritdoc cref="IClient.ClientDisconnected"/>
@@ -43,9 +43,15 @@ namespace RiptideNetworking
         /// <summary>Encapsulates a method that handles a message from the server.</summary>
         /// <param name="message">The message that was received.</param>
         public delegate void MessageHandler(Message message);
+        /// <summary>Encapsulates a method that handles a message's progress from the server.</summary>
+        /// <param name="messageProgress">The message that was received.</param>
+        public delegate void MessageProgressHandler(PartialMessageProgress messageProgress);
 
         /// <summary>Methods used to handle messages, accessible by their corresponding message IDs.</summary>
-        private Dictionary<ushort, MessageHandler> messageHandlers;
+        internal Dictionary<ushort, MessageHandler> messageHandlers;
+        /// <summary>Methods used to handle a message's progress, accessible by their corresponding message IDs.</summary>
+        internal Dictionary<ushort, MessageProgressHandler> messageProgressHandlers;
+
         /// <summary>The underlying client that is used for sending and receiving data.</summary>
         private IClient client;
 
@@ -77,11 +83,14 @@ namespace RiptideNetworking
         ///   Riptide's default transport expects the host address to consist of an IP and port, separated by a colon. For example: <c>127.0.0.1:7777</c>.<br/>
         ///   If you are using a different transport, check the relevant documentation for what information it requires in the host address.
         /// </remarks>
-        public void Connect(string hostAddress, byte messageHandlerGroupId = 0, Message message = null)
+        /// <returns><see langword="true"/> if the <paramref name="hostAddress"/> was in a valid format; otherwise <see langword="false"/>.</returns>
+        public bool Connect(string hostAddress, byte messageHandlerGroupId = 0, Message message = null)
         {
             Disconnect();
 
+            IncreaseActiveSocketCount();
             CreateMessageHandlersDictionary(Assembly.GetCallingAssembly(), messageHandlerGroupId);
+            CreateMessageProgressHandlersDictionary(Assembly.GetCallingAssembly(), messageHandlerGroupId);
 
             client.Connected += OnConnected;
             client.ConnectionFailed += OnConnectionFailed;
@@ -89,7 +98,10 @@ namespace RiptideNetworking
             client.Disconnected += OnDisconnected;
             client.ClientConnected += OnClientConnected;
             client.ClientDisconnected += OnClientDisconnected;
-            client.Connect(hostAddress, message);
+
+            PartialMessageHandler.Client = this;
+
+            return client.Connect(hostAddress, message);
         }
 
         /// <inheritdoc/>
@@ -133,6 +145,46 @@ namespace RiptideNetworking
         }
 
         /// <inheritdoc/>
+        protected override void CreateMessageProgressHandlersDictionary(Assembly assembly, byte messageHandlerGroupId)
+        {
+            MethodInfo[] methods = assembly.GetTypes()
+                                           .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)) // Include instance methods in the search so we can show the developer an error instead of silently not adding instance methods to the dictionary
+                                           .Where(m => m.GetCustomAttributes(typeof(MessageHandlerProgressAttribute), false).Length > 0)
+                                           .ToArray();
+
+            messageProgressHandlers = new Dictionary<ushort, MessageProgressHandler>(methods.Length);
+            for (int i = 0; i < methods.Length; i++)
+            {
+                MessageHandlerProgressAttribute attribute = methods[i].GetCustomAttribute<MessageHandlerProgressAttribute>();
+                if (attribute.GroupId != messageHandlerGroupId)
+                    continue;
+
+                if (!methods[i].IsStatic)
+                    throw new Exception($"Message Progress handler methods should be static, but '{methods[i].DeclaringType}.{methods[i].Name}' is an instance method!");
+
+                Delegate clientMessageHandler = Delegate.CreateDelegate(typeof(MessageProgressHandler), methods[i], false);
+                if (clientMessageHandler != null)
+                {
+                    // It's a message progress handler for Client instances
+                    if (messageProgressHandlers.ContainsKey(attribute.MessageId))
+                    {
+                        MethodInfo otherMethodWithId = messageProgressHandlers[attribute.MessageId].GetMethodInfo();
+                        throw new Exception($"Client-side message progress handler methods '{methods[i].DeclaringType}.{methods[i].Name}' and '{otherMethodWithId.DeclaringType}.{otherMethodWithId.Name}' are both set to handle messages with ID {attribute.MessageId}! Only one handler method is allowed per message ID!");
+                    }
+                    else
+                        messageProgressHandlers.Add(attribute.MessageId, (MessageProgressHandler)clientMessageHandler);
+                }
+                else
+                {
+                    // It's not a message handler for Client instances, but it might be one for Server instances
+                    Delegate serverMessageHandler = Delegate.CreateDelegate(typeof(Server.MessageProgressHandler), methods[i], false);
+                    if (serverMessageHandler == null)
+                        throw new Exception($"'{methods[i].DeclaringType}.{methods[i].Name}' doesn't match any acceptable message progress handler method signatures, double-check its parameters!");
+                }
+            }
+        }
+
+        /// <inheritdoc/>
         public override void Tick() => client.Tick();
 
         /// <inheritdoc cref="IClient.Send(Message, bool)"/>
@@ -145,9 +197,9 @@ namespace RiptideNetworking
                 return;
 
             client.Disconnect();
-            LocalDisconnect();
         }
 
+        /// <summary>Cleans up local objects on disconnection.</summary>
         private void LocalDisconnect()
         {
             client.Connected -= OnConnected;
@@ -156,20 +208,28 @@ namespace RiptideNetworking
             client.Disconnected -= OnDisconnected;
             client.ClientConnected -= OnClientConnected;
             client.ClientDisconnected -= OnClientDisconnected;
+
+            DecreaseActiveSocketCount();
         }
 
         /// <summary>Invokes the <see cref="Connected"/> event.</summary>
-        private void OnConnected(object s, EventArgs e) => Connected?.Invoke(this, e);
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnConnected(object sender, EventArgs e) => Connected?.Invoke(this, e);
 
         /// <summary>Invokes the <see cref="ConnectionFailed"/> event.</summary>
-        private void OnConnectionFailed(object s, EventArgs e)
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnConnectionFailed(object sender, EventArgs e)
         {
             LocalDisconnect();
             ConnectionFailed?.Invoke(this, e);
         }
 
         /// <summary>Invokes the <see cref="MessageReceived"/> event and initiates handling of the received message.</summary>
-        private void OnMessageReceived(object s, ClientMessageReceivedEventArgs e)
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnMessageReceived(object sender, ClientMessageReceivedEventArgs e)
         {
             MessageReceived?.Invoke(this, e);
 
@@ -177,19 +237,28 @@ namespace RiptideNetworking
                 messageHandler(e.Message);
             else
                 RiptideLogger.Log(LogType.warning, $"No client-side handler method found for message ID {e.MessageId}!");
+
+            //if (messageProgressHandlers.TryGetValue(e.MessageId, out MessageProgressHandler messageProgressHandler))
+            //    messageProgressHandler(e.);
         }
 
         /// <summary>Invokes the <see cref="Disconnected"/> event.</summary>
-        private void OnDisconnected(object s, EventArgs e)
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnDisconnected(object sender, DisconnectedEventArgs e)
         {
             LocalDisconnect();
             Disconnected?.Invoke(this, e);
         }
 
         /// <summary>Invokes the <see cref="ClientConnected"/> event.</summary>
-        private void OnClientConnected(object s, ClientConnectedEventArgs e) => ClientConnected?.Invoke(this, e);
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnClientConnected(object sender, ClientConnectedEventArgs e) => ClientConnected?.Invoke(this, e);
 
         /// <summary>Invokes the <see cref="ClientDisconnected"/> event.</summary>
-        private void OnClientDisconnected(object s, ClientDisconnectedEventArgs e) => ClientDisconnected?.Invoke(this, e);
+        /// <param name="sender">The source of the event.</param>
+        /// <param name="e">The event args to invoke the event with.</param>
+        private void OnClientDisconnected(object sender, ClientDisconnectedEventArgs e) => ClientDisconnected?.Invoke(this, e);
     }
 }

@@ -47,7 +47,7 @@ namespace RiptideNetworking
         public delegate void MessageProgressHandler(PartialMessageProgress messageProgress);
 
         /// <summary>Methods used to handle messages, accessible by their corresponding message IDs.</summary>
-        private Dictionary<ushort, MessageHandler> messageHandlers;
+        public Dictionary<ushort, MessageHandler> messageHandlers;
         /// <summary>Methods used to handle a message's progress, accessible by their corresponding message IDs.</summary>
         private Dictionary<ushort, MessageProgressHandler> messageProgressHandlers;
         /// <summary>The underlying server that is used for managing connections and sending and receiving data.</summary>
